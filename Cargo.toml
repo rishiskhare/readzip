@@ -1,0 +1,19 @@
+[workspace]
+members = [
+  "crates/readzip-core",
+  "crates/readzip-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/rishiskhare/readzip"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = "z"
+
