@@ -69,14 +69,23 @@ mv "$tmp/readzip" "$INSTALL_DIR/readzip"
 info "installed readzip ${VERSION} → ${INSTALL_DIR}/readzip"
 
 case ":$PATH:" in
-  *":$INSTALL_DIR:"*) ;;
+  *":$INSTALL_DIR:"*)
+    on_path=1
+    ;;
   *)
+    on_path=0
     printf "\n\033[38;5;111mnote:\033[0m %s is not on your PATH.\n" "$INSTALL_DIR"
     printf "      add this line to your shell profile, then re-open the terminal:\n\n"
     printf "        export PATH=\"%s:\$PATH\"\n\n" "$INSTALL_DIR"
     ;;
 esac
 
-printf "\n  next:  \033[38;5;75mreadzip init\033[0m       wire up Claude Code + any installed MCP agents\n"
-printf "         \033[38;5;75mreadzip demo\033[0m       see compression on a sample file\n"
-printf "         \033[38;5;75mreadzip eval <dir>\033[0m measure savings on your own codebase\n\n"
+# Auto-wire any installed agents (Claude Code, Codex, Cursor, Cline, Windsurf, Gemini CLI).
+# `readzip init --yes` skips the modify-settings.json confirmation prompt and only
+# registers integrations for agents whose config dirs already exist on the box.
+if [ "$on_path" = "1" ] || [ -x "${INSTALL_DIR}/readzip" ]; then
+  printf "\n"
+  "${INSTALL_DIR}/readzip" init --yes || true
+fi
+
+printf "\nrestart your AI tool to pick up the new hook.\n\n"

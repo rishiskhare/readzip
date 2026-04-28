@@ -13,15 +13,15 @@ Initial public release.
 - Claude Code `PreToolUse` hook returns `permissionDecision: "deny"` with the skeleton in `permissionDecisionReason` — the path that's reliable across current Claude Code versions. Does not depend on `updatedInput`.
 - Cache validates by mtime + size on the fast path; falls through to a content-hash bypass for files that were touched (git checkout, formatter no-op) but not actually changed.
 
-### Multi-agent installer
-- `readzip init` registers integrations for Claude Code (native hook), Codex (MCP + AGENTS.md hint), Cursor (MCP), Cline (MCP), Windsurf (MCP), and Gemini CLI (MCP).
-- `--only=a,b` and `--skip=a,b` flags scope the install. `--yes` skips the confirmation prompt for modifying existing settings.
-- `readzip uninstall` removes the readzip hook from Claude Code and the MCP entries from every supported agent.
-
-### CLI
+### CLI surface
+- Three primary commands work from Bash for any agent: `readzip read <file>` (smart cat — skeleton if large, full if small), `readzip section <file> <offset> <limit>` (scoped line range), `readzip skeleton <file>` (always print the skeleton).
+- `readzip stats` is always-on local-only telemetry. Reports files intercepted, tokens saved, average reduction.
+- `readzip doctor` reports Claude hook + Codex hint installation status.
 - `readzip eval <dir>` walks a corpus and reports total token savings as a markdown table or JSON.
-- `readzip stats` is always-on local-only telemetry — no opt-in flag. Reports files intercepted, tokens saved, average reduction, and context-window equivalents.
-- `readzip doctor` reports per-agent MCP installation status alongside the Claude hook check.
+
+### Installer
+- `install.sh` auto-runs `readzip init --yes`, which wires up the Claude Code `PreToolUse` hook (if Claude Code is installed) and drops a Codex `AGENTS.md` snippet (if `~/.codex/` exists). No other agents need any setup — they just call the CLI from Bash.
+- `uninstall.sh` reverses everything: removes the hook, the Codex hint, the binary, the cache, and (with `--purge`) the config dir.
 
 ### Distribution
 - Single static Rust binary (~28 MB with all 16 grammars bundled, no runtime parser deps).

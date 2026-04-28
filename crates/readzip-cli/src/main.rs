@@ -5,7 +5,7 @@ use readzip_core::{
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,7 +27,8 @@ fn main() {
         Some("uninstall") => uninstall(&args[2..]),
         Some("doctor") => doctor(&args[2..]),
         Some("skeleton") => skeleton_cmd(&args[2..]),
-        Some("mcp") => mcp_server(),
+        Some("read") => read_cmd(&args[2..]),
+        Some("section") => section_cmd(&args[2..]),
         Some("eval") => eval_cmd(&args[2..]),
         Some(other) => Err(format!("unknown command: {other}")),
     };
@@ -40,7 +41,7 @@ fn main() {
 
 fn help() -> Result<(), String> {
     println!(
-        "readzip {VERSION}\n\nUSAGE:\n  readzip init [--yes] [--only=a,b | --skip=a,b]\n  readzip hook\n  readzip demo [--json]\n  readzip stats [--json]\n  readzip eval <dir> [--json]\n  readzip uninstall [--keep-cache]\n  readzip doctor [--json]\n  readzip skeleton <file>\n  readzip mcp\n\nKnown agents (init only registers integrations for ones it detects):\n  claude    native PreToolUse hook (transparent)\n  codex     advisory AGENTS.md hint + MCP server\n  cursor    MCP server in ~/.cursor/mcp.json\n  cline     MCP server in the Cline VS Code extension config\n  windsurf  MCP server in ~/.codeium/windsurf/mcp_config.json\n  gemini    MCP server in ~/.gemini/settings.json\n\nUse --only=a,b to limit, --skip=a,b to exclude, or --only=<x> to force install\nfor an agent that init didn't auto-detect.\n"
+        "readzip {VERSION}\n\nFile-read CLI for AI coding agents. ~80% fewer tokens on large files.\n\nUSAGE — primary commands:\n  readzip read <file>                     smart cat: skeleton if large, full if small\n  readzip section <file> <offset> <limit> print a scoped line range\n  readzip skeleton <file>                 always print the structural skeleton\n  readzip stats [--json]                  tokens saved so far (local-only)\n\nUSAGE — installation & diagnostics:\n  readzip doctor [--json]                 verify the Claude Code hook is wired up\n  readzip demo [--json]                   compression on a bundled fixture\n  readzip init [--yes]                    wire up Claude Code (auto-run by install.sh)\n  readzip uninstall [--keep-cache] [--purge]\n                                          remove hook (--purge also wipes config)\n\nUSAGE — advanced (rarely run by hand):\n  readzip hook                            PreToolUse handler (Claude Code calls this)\n  readzip eval <dir> [--json]             corpus eval (development)\n\nFor Claude Code, init installs a transparent `PreToolUse` hook on `Read`.\nFor every other agent (Codex, Cursor, Cline, Windsurf, Gemini, Aider, …),\njust call the primary commands from Bash — no setup required.\n"
     );
     Ok(())
 }
@@ -52,139 +53,65 @@ fn init(args: &[String]) -> Result<(), String> {
     print_banner(false);
     ensure_config(false)?;
 
-    enum Outcome {
-        Installed,
-        NotInstalled,
-        Skipped,
+    let mut installed = Vec::<&'static str>::new();
+    let mut skipped = Vec::<&'static str>::new();
+
+    if agents.wants("claude") {
+        if agent_present("claude") || force {
+            install_claude_hook(yes)?;
+            installed.push("Claude Code");
+        } else {
+            skipped.push("Claude Code (not installed; --only=claude to force)");
+        }
     }
 
-    let mut report: Vec<(&'static str, Outcome, String)> = Vec::new();
-
-    let run_agent = |wants: bool,
-                     present: bool,
-                     install_fn: &dyn Fn() -> Result<(), String>|
-     -> Result<Outcome, String> {
-        if !wants {
-            return Ok(Outcome::Skipped);
+    if agents.wants("codex") {
+        if agent_present("codex") || force {
+            install_codex_hint()?;
+            installed.push("Codex (AGENTS.md hint)");
+        } else {
+            skipped.push("Codex (not installed)");
         }
-        if !present && !force {
-            return Ok(Outcome::NotInstalled);
-        }
-        install_fn()?;
-        Ok(Outcome::Installed)
-    };
-
-    let claude_path = home_path(".claude/settings.json")
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let claude_outcome = run_agent(
-        agents.wants("claude"),
-        agent_present("claude"),
-        &|| install_claude_hook(yes),
-    )?;
-    report.push(("Claude Code", claude_outcome, claude_path));
-
-    let codex_path = home_path(".codex/mcp.json").map(|p| p.display().to_string()).unwrap_or_default();
-    let codex_outcome = run_agent(
-        agents.wants("codex"),
-        agent_present("codex"),
-        &install_codex_hint,
-    )?;
-    report.push(("Codex", codex_outcome, codex_path));
-
-    let cursor_path = home_path(".cursor/mcp.json").map(|p| p.display().to_string()).unwrap_or_default();
-    let cursor_outcome = run_agent(
-        agents.wants("cursor"),
-        agent_present("cursor"),
-        &install_cursor_mcp,
-    )?;
-    report.push(("Cursor", cursor_outcome, cursor_path));
-
-    let cline_path = "Cline VS Code extension".to_string();
-    let cline_outcome = run_agent(
-        agents.wants("cline"),
-        agent_present("cline"),
-        &install_cline_mcp,
-    )?;
-    report.push(("Cline", cline_outcome, cline_path));
-
-    let windsurf_path = home_path(".codeium/windsurf/mcp_config.json")
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let windsurf_outcome = run_agent(
-        agents.wants("windsurf"),
-        agent_present("windsurf"),
-        &install_windsurf_mcp,
-    )?;
-    report.push(("Windsurf", windsurf_outcome, windsurf_path));
-
-    let gemini_path = home_path(".gemini/settings.json").map(|p| p.display().to_string()).unwrap_or_default();
-    let gemini_outcome = run_agent(
-        agents.wants("gemini"),
-        agent_present("gemini"),
-        &install_gemini_mcp,
-    )?;
-    report.push(("Gemini CLI", gemini_outcome, gemini_path));
+    }
 
     for unsupported in agents.requested_unsupported() {
-        eprintln!(
-            "readzip: agent '{unsupported}' install path not yet implemented; skipping."
-        );
+        eprintln!("readzip: agent '{unsupported}' install path not yet implemented; skipping.");
     }
 
     println!();
-    let mut installed_count = 0;
-    for (agent, outcome, path) in &report {
-        match outcome {
-            Outcome::Installed => {
-                installed_count += 1;
-                println!("  ✓  {:<12}  {}", agent, path);
-            }
-            Outcome::NotInstalled => {
-                println!("  ·  {:<12}  not installed (skipped — use --only={} to force)", agent, agent.to_lowercase().replace(' ', ""));
-            }
-            Outcome::Skipped => {
-                println!("  ·  {:<12}  skipped via --skip / --only", agent);
-            }
-        }
+    for agent in &installed {
+        println!("  ✓  {agent}");
+    }
+    for agent in &skipped {
+        println!("  ·  {agent}");
     }
 
-    println!();
-    if installed_count == 0 {
-        println!("No agents were detected on this machine. Install one (Claude Code, Codex, Cursor,");
-        println!("Cline, Windsurf, or Gemini CLI), or rerun `readzip init --only=<agent>` to force.");
+    if installed.is_empty() {
+        println!();
+        println!("No agents were wired up. Install Claude Code (or `--only=claude` to force).");
+        println!();
+        println!("Other agents (Codex, Cursor, Cline, Windsurf, Gemini, Aider, …) don't need");
+        println!("any setup — just call readzip from Bash:");
+        println!("  readzip read <file>                        # smart cat");
+        println!("  readzip section <file> <offset> <limit>    # scoped slice");
         return Ok(());
     }
 
-    println!("readzip is now active. Try it:");
-    println!("  1. Open your agent in a project with a file > 500 lines.");
-    println!("  2. Ask it to read that file (without specifying a line range).");
-    println!("  3. After a few minutes:  readzip stats");
     println!();
-    println!("Or run a corpus eval right now:  readzip eval <some-source-dir>");
+    println!("readzip is now active. Try it:");
+    println!("  1. Restart your AI tool.");
+    println!("  2. Ask it to read a file >500 lines.");
+    println!("  3. After a few minutes:  readzip stats");
     Ok(())
 }
 
 fn agent_present(agent: &str) -> bool {
-    fn dir_exists(rel: &str) -> bool {
-        home_path(rel).map(|p| p.exists()).unwrap_or(false)
-    }
-    fn any_exists(rels: &[&str]) -> bool {
-        rels.iter().any(|r| dir_exists(r))
-    }
-    match agent {
-        "claude" => any_exists(&[".claude"]),
-        "codex" => any_exists(&[".codex"]),
-        "cursor" => any_exists(&[".cursor"]),
-        "cline" => any_exists(&[
-            "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev",
-            ".config/Code/User/globalStorage/saoudrizwan.claude-dev",
-            ".config/cline",
-        ]),
-        "windsurf" => any_exists(&[".codeium/windsurf", ".codeium"]),
-        "gemini" => any_exists(&[".gemini"]),
-        _ => false,
-    }
+    let rel = match agent {
+        "claude" => ".claude",
+        "codex" => ".codex",
+        _ => return false,
+    };
+    home_path(rel).map(|p| p.exists()).unwrap_or(false)
 }
 
 #[derive(Debug, Default)]
@@ -194,11 +121,7 @@ struct AgentSelection {
     requested: Vec<String>,
 }
 
-const SUPPORTED_AGENTS_NATIVE: &[&str] = &["claude"];
-const SUPPORTED_AGENTS_HINT: &[&str] = &["codex", "cursor", "cline", "windsurf", "gemini"];
-const KNOWN_AGENTS: &[&str] = &[
-    "claude", "codex", "cursor", "cline", "windsurf", "gemini",
-];
+const KNOWN_AGENTS: &[&str] = &["claude", "codex"];
 
 impl AgentSelection {
     fn wants(&self, agent: &str) -> bool {
@@ -208,25 +131,19 @@ impl AgentSelection {
         if let Some(only) = &self.only {
             return only.iter().any(|a| a == agent);
         }
-        // Default behavior: install everything we currently support.
-        SUPPORTED_AGENTS_NATIVE.contains(&agent) || SUPPORTED_AGENTS_HINT.contains(&agent)
+        KNOWN_AGENTS.contains(&agent)
     }
 
-    /// True iff the user passed --only/--agents/--skip — i.e. force-install regardless of detection.
+    /// True iff the user passed --only/--skip — i.e. force-install regardless of detection.
     fn user_specified(&self) -> bool {
         self.only.is_some() || !self.skip.is_empty()
     }
 
+    /// Names from --only/--skip that we don't recognize, so we can warn instead of silently ignoring.
     fn requested_unsupported(&self) -> Vec<String> {
-        let supported: Vec<&str> = SUPPORTED_AGENTS_NATIVE
-            .iter()
-            .chain(SUPPORTED_AGENTS_HINT.iter())
-            .copied()
-            .collect();
         self.requested
             .iter()
-            .filter(|a| KNOWN_AGENTS.contains(&a.as_str()))
-            .filter(|a| !supported.iter().any(|s| s == &a.as_str()))
+            .filter(|a| !KNOWN_AGENTS.contains(&a.as_str()))
             .cloned()
             .collect()
     }
@@ -474,51 +391,25 @@ fn format_tokens(n: usize) -> String {
 
 fn uninstall(args: &[String]) -> Result<(), String> {
     let keep_cache = args.iter().any(|arg| arg == "--keep-cache");
+    let purge = args.iter().any(|arg| arg == "--purge");
     uninstall_claude_hook()?;
-    for path in mcp_agent_paths().into_iter().flatten() {
-        uninstall_mcp_from(&path)?;
+    // Drop the Codex AGENTS hint init may have written; otherwise orphaned.
+    if let Some(hint) = home_path(".codex/readzip-AGENTS-snippet.md") {
+        let _ = fs::remove_file(&hint);
     }
     if !keep_cache {
         let config = load_config();
         let _ = fs::remove_dir_all(&config.cache_dir);
     }
+    if purge {
+        if let Some(config_dir) = home_path(".config/readzip") {
+            let _ = fs::remove_dir_all(&config_dir);
+        }
+    }
     println!("readzip uninstalled.");
-    Ok(())
-}
-
-fn mcp_agent_paths() -> Vec<Option<PathBuf>> {
-    vec![
-        home_path(".codex/mcp.json"),
-        home_path(".cursor/mcp.json"),
-        home_path("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
-        home_path(".config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
-        home_path(".config/cline/cline_mcp_settings.json"),
-        home_path(".codeium/windsurf/mcp_config.json"),
-        home_path(".gemini/settings.json"),
-    ]
-}
-
-fn uninstall_mcp_from(path: &Path) -> Result<(), String> {
-    let Ok(existing) = fs::read_to_string(path) else {
-        return Ok(());
-    };
-    if !existing.contains("\"readzip\"") {
-        return Ok(());
+    if !purge {
+        println!("(config kept at ~/.config/readzip — pass --purge to delete it too.)");
     }
-    let mut settings: Value = match serde_json::from_str(&existing) {
-        Ok(v) => v,
-        Err(_) => return Ok(()), // Don't damage non-JSON files we partially wrote.
-    };
-    if let Some(servers) = settings
-        .get_mut("mcpServers")
-        .and_then(Value::as_object_mut)
-    {
-        servers.remove("readzip");
-    }
-    let pretty = serde_json::to_string_pretty(&settings)
-        .map_err(|err| format!("failed to serialize settings: {err}"))?;
-    fs::write(path, format!("{pretty}\n"))
-        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     Ok(())
 }
 
@@ -532,7 +423,9 @@ fn doctor(args: &[String]) -> Result<(), String> {
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|text| text.contains("readzip hook"))
         .unwrap_or(false);
-    let mcp_status = check_mcp_agents();
+    let codex_hint_installed = home_path(".codex/readzip-AGENTS-snippet.md")
+        .map(|p| p.exists())
+        .unwrap_or(false);
     if json {
         println!(
             "{}",
@@ -541,13 +434,7 @@ fn doctor(args: &[String]) -> Result<(), String> {
                 "config_path": config_path,
                 "cache_dir": config.cache_dir,
                 "claude_hook_installed": claude_installed,
-                "mcp_agents": mcp_status.iter()
-                    .map(|(agent, installed, _)| (agent.to_string(), Value::Bool(*installed)))
-                    .collect::<serde_json::Map<String, Value>>(),
-                "known_limitations": [
-                    "Native Read hooks fire for Claude Code only; MCP agents must choose readzip's MCP tools",
-                    "Claude MCP filesystem reads bypass native Read hooks (issue #33106)"
-                ]
+                "codex_hint_installed": codex_hint_installed,
             })
         );
         return Ok(());
@@ -557,42 +444,11 @@ fn doctor(args: &[String]) -> Result<(), String> {
     println!("  config:                {}", config_path.display());
     println!("  cache:                 {}", config.cache_dir.display());
     println!("  Claude hook installed: {claude_installed}");
-    for (agent, installed, path) in &mcp_status {
-        println!(
-            "  {:<10} MCP:        {} ({})",
-            agent,
-            if *installed { "yes" } else { "no" },
-            path
-        );
-    }
-    println!("  limitation: only Claude Code is transparent — other agents must choose readzip's MCP tools.");
-    println!("  limitation: Claude MCP filesystem reads bypass native Read hooks (issue #33106).");
+    println!("  Codex hint installed:  {codex_hint_installed}");
+    println!();
+    println!("  Other agents (Cursor, Cline, Windsurf, Gemini, Aider, …) need no setup —");
+    println!("  they call `readzip read <file>` from Bash directly.");
     Ok(())
-}
-
-fn check_mcp_agents() -> Vec<(&'static str, bool, String)> {
-    let entries: &[(&str, &str)] = &[
-        ("Codex", ".codex/mcp.json"),
-        ("Cursor", ".cursor/mcp.json"),
-        ("Windsurf", ".codeium/windsurf/mcp_config.json"),
-        ("Gemini", ".gemini/settings.json"),
-    ];
-    entries
-        .iter()
-        .map(|(name, rel)| {
-            let path = home_path(rel);
-            let installed = path
-                .as_ref()
-                .and_then(|p| fs::read_to_string(p).ok())
-                .map(|text| text.contains("\"readzip\""))
-                .unwrap_or(false);
-            let display = path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| rel.to_string());
-            (*name, installed, display)
-        })
-        .collect()
 }
 
 fn eval_cmd(args: &[String]) -> Result<(), String> {
@@ -819,226 +675,58 @@ fn skeleton_cmd(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn mcp_server() -> Result<(), String> {
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut stdout = io::stdout();
-    loop {
-        let Some((message, framed)) = read_mcp_message(&mut reader)? else {
-            break;
-        };
-        let payload: Value =
-            serde_json::from_str(&message).map_err(|err| format!("invalid MCP JSON: {err}"))?;
-        let method = payload
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if method == "notifications/initialized" {
-            continue;
-        }
-        let response = handle_mcp_message(&payload);
-        write_mcp_response(&mut stdout, &response, framed)?;
+/// Smart `cat` replacement for AI agents calling readzip from Bash.
+/// If the file is large enough (and in a supported language) to be intercepted
+/// by the hook, prints the structural skeleton. Otherwise prints the file
+/// verbatim, exactly like `cat`.
+fn read_cmd(args: &[String]) -> Result<(), String> {
+    let Some(file) = args.first() else {
+        return Err("usage: readzip read <file>".to_string());
+    };
+    let path = Path::new(file);
+    let config = load_config();
+    let source = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {file}: {err}"))?;
+    let line_count = source.lines().count();
+    if !should_intercept(path, line_count, &config) {
+        // Small file, unsupported language, or in force_full_for / bypass_for —
+        // pass through full content like cat.
+        print!("{source}");
+        return Ok(());
     }
+    let skeleton = readzip_core::build_skeleton_from_source(path, &source, &config);
+    if skeleton.text.contains("No top-level symbols detected") {
+        // No useful skeleton — fall through to full content.
+        print!("{source}");
+        return Ok(());
+    }
+    println!("{}", skeleton.text);
     Ok(())
 }
 
-fn read_mcp_message<R: BufRead>(reader: &mut R) -> Result<Option<(String, bool)>, String> {
-    let mut first = String::new();
-    let bytes = reader
-        .read_line(&mut first)
-        .map_err(|err| format!("failed to read MCP stdin: {err}"))?;
-    if bytes == 0 {
-        return Ok(None);
+/// Print a 1-indexed line range of a file (matches Claude Code's `Read` semantics).
+fn section_cmd(args: &[String]) -> Result<(), String> {
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let file = positional
+        .first()
+        .ok_or_else(|| "usage: readzip section <file> <offset> <limit>".to_string())?;
+    let offset: usize = positional
+        .get(1)
+        .ok_or_else(|| "usage: readzip section <file> <offset> <limit>".to_string())?
+        .parse()
+        .map_err(|err| format!("offset must be a positive integer: {err}"))?;
+    let limit: usize = positional
+        .get(2)
+        .ok_or_else(|| "usage: readzip section <file> <offset> <limit>".to_string())?
+        .parse()
+        .map_err(|err| format!("limit must be a positive integer: {err}"))?;
+    if offset == 0 {
+        return Err("offset is 1-indexed; use 1 for the first line".to_string());
     }
-    if first.trim().is_empty() {
-        return read_mcp_message(reader);
-    }
-    if first.trim_start().starts_with('{') {
-        return Ok(Some((first, false)));
-    }
-
-    let mut content_length = None;
-    let mut header = first;
-    loop {
-        let trimmed = header.trim();
-        if let Some((name, value)) = trimmed.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse::<usize>().ok();
-            }
-        }
-        header.clear();
-        let bytes = reader
-            .read_line(&mut header)
-            .map_err(|err| format!("failed to read MCP header: {err}"))?;
-        if bytes == 0 || header.trim().is_empty() {
-            break;
-        }
-    }
-
-    let Some(length) = content_length else {
-        return Err("MCP message missing Content-Length".to_string());
-    };
-    let mut body = vec![0_u8; length];
-    reader
-        .read_exact(&mut body)
-        .map_err(|err| format!("failed to read MCP body: {err}"))?;
-    let message = String::from_utf8(body).map_err(|err| format!("MCP body is not UTF-8: {err}"))?;
-    Ok(Some((message, true)))
-}
-
-fn handle_mcp_message(payload: &Value) -> String {
-    let id = payload.get("id").cloned().unwrap_or(Value::Null);
-    let method = payload
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    match method {
-        "initialize" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "readzip", "version": VERSION}
-            }
-        })
-        .to_string(),
-        "tools/list" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {"tools": mcp_tools()}
-        })
-        .to_string(),
-        "tools/call" => {
-            let params = payload.get("params").unwrap_or(&Value::Null);
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let args = params.get("arguments").unwrap_or(&Value::Null);
-            mcp_tool_call_response(&id, name, args)
-        }
-        _ => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {"code": -32601, "message": "unknown method"}
-        })
-        .to_string(),
-    }
-}
-
-fn write_mcp_response<W: Write>(
-    writer: &mut W,
-    response: &str,
-    framed: bool,
-) -> Result<(), String> {
-    if framed {
-        write!(
-            writer,
-            "Content-Length: {}\r\n\r\n{}",
-            response.len(),
-            response
-        )
-        .map_err(|err| format!("failed to write MCP response: {err}"))?;
-    } else {
-        writeln!(writer, "{response}")
-            .map_err(|err| format!("failed to write MCP response: {err}"))?;
-    }
-    writer
-        .flush()
-        .map_err(|err| format!("failed to flush MCP stdout: {err}"))
-}
-
-fn mcp_tools() -> Value {
-    json!([
-        {
-            "name": "readzip_skeleton",
-            "description": "Return a compact structural skeleton for a source file.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"file_path": {"type": "string"}},
-                "required": ["file_path"]
-            }
-        },
-        {
-            "name": "readzip_section",
-            "description": "Return a scoped section of a file by offset and limit.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string"},
-                    "offset": {"type": "number"},
-                    "limit": {"type": "number"}
-                },
-                "required": ["file_path", "offset", "limit"]
-            }
-        },
-        {
-            "name": "readzip_stats",
-            "description": "Return local readzip savings stats.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }
-    ])
-}
-
-fn mcp_tool_call_response(id: &Value, name: &str, args: &Value) -> String {
-    let result = match name {
-        "readzip_skeleton" => {
-            let Some(file_path) = args.get("file_path").and_then(Value::as_str) else {
-                return mcp_error(id, "missing file_path");
-            };
-            let config = load_config();
-            match build_skeleton(Path::new(&file_path), &config) {
-                Ok(skeleton) => skeleton.text,
-                Err(err) => return mcp_error(id, &format!("failed to build skeleton: {err}")),
-            }
-        }
-        "readzip_section" => {
-            let Some(file_path) = args.get("file_path").and_then(Value::as_str) else {
-                return mcp_error(id, "missing file_path");
-            };
-            let offset = args
-                .get("offset")
-                .and_then(Value::as_u64)
-                .unwrap_or(1)
-                .max(1) as usize;
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(120)
-                .max(1) as usize;
-            match read_section(Path::new(&file_path), offset, limit) {
-                Ok(section) => section,
-                Err(err) => return mcp_error(id, &format!("failed to read section: {err}")),
-            }
-        }
-        "readzip_stats" => {
-            let config = load_config();
-            let stats = read_stats(&config);
-            json!({
-                "files_intercepted": stats.files_intercepted,
-                "tokens_saved": stats.tokens_saved(),
-                "avg_reduction_percent": rounded_percent(stats.avg_reduction_percent())
-            })
-            .to_string()
-        }
-        _ => return mcp_error(id, "unknown tool"),
-    };
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {"content": [{"type": "text", "text": result}]}
-    })
-    .to_string()
-}
-
-fn mcp_error(id: &Value, message: &str) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {"code": -32000, "message": message}
-    })
-    .to_string()
+    let text = read_section(Path::new(file.as_str()), offset, limit)
+        .map_err(|err| format!("failed to read section of {file}: {err}"))?;
+    print!("{text}");
+    Ok(())
 }
 
 fn read_section(path: &Path, offset: usize, limit: usize) -> io::Result<String> {
@@ -1227,103 +915,14 @@ fn install_codex_hint() -> Result<(), String> {
     let hint_path = codex_dir.join("readzip-AGENTS-snippet.md");
     fs::write(
         hint_path,
-        "When inspecting large source files, prefer the readzip MCP tools: readzip_skeleton first, then readzip_section for the needed symbol or range. Native read_file may bypass readzip; verify savings with `readzip stats`.\n",
+        "When inspecting source files larger than ~500 lines, run readzip from Bash:\n\
+         - `readzip read <file>` — smart cat: skeleton if large, full if small. Saves ~80% tokens on large files.\n\
+         - `readzip section <file> <offset> <limit>` — scoped line range when you know what to read.\n\
+         - `readzip stats` — tokens saved so far (local-only).\n\n\
+         These commands are a single static binary on PATH; they parse with tree-sitter and never make network calls.\n",
     )
     .map_err(|err| format!("failed to write Codex hint: {err}"))?;
-    install_mcp_into(home_path(".codex/mcp.json"), "Codex")
-}
-
-fn install_cursor_mcp() -> Result<(), String> {
-    install_mcp_into(home_path(".cursor/mcp.json"), "Cursor")
-}
-
-fn install_cline_mcp() -> Result<(), String> {
-    // Cline's VS Code extension stores its MCP config under the user data dir;
-    // the location varies by OS. We try the most common path; if missing,
-    // we drop a config in `~/.config/cline/` and let the user move it.
-    let candidates = [
-        home_path("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
-        home_path(".config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
-        home_path(".config/cline/cline_mcp_settings.json"),
-    ];
-    let target = candidates
-        .into_iter()
-        .flatten()
-        .find(|p| p.parent().map(|d| d.exists()).unwrap_or(false))
-        .or_else(|| home_path(".config/cline/cline_mcp_settings.json"));
-    install_mcp_into(target, "Cline")
-}
-
-fn install_windsurf_mcp() -> Result<(), String> {
-    install_mcp_into(home_path(".codeium/windsurf/mcp_config.json"), "Windsurf")
-}
-
-fn install_gemini_mcp() -> Result<(), String> {
-    install_mcp_into(home_path(".gemini/settings.json"), "Gemini CLI")
-}
-
-fn install_mcp_into(target: Option<PathBuf>, agent_label: &str) -> Result<(), String> {
-    let Some(path) = target else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("failed to create {agent_label} config dir: {err}"))?;
-    }
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    if existing.contains("\"readzip\"") {
-        return Ok(());
-    }
-    if path.exists() && !existing.trim().is_empty() {
-        let suffix = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("json");
-        let backup =
-            path.with_extension(format!("{suffix}.readzip-bak-{}", unix_time()));
-        fs::copy(&path, &backup)
-            .map_err(|err| format!("failed to back up {agent_label} settings: {err}"))?;
-    }
-
-    let mut settings: Value = if existing.trim().is_empty() {
-        json!({})
-    } else {
-        serde_json::from_str(&existing).map_err(|err| {
-            format!(
-                "{agent_label} settings at {} are not valid JSON; refusing to edit: {err}",
-                path.display()
-            )
-        })?
-    };
-    ensure_object(&mut settings)?;
-    let servers = settings
-        .as_object_mut()
-        .expect("validated object")
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}));
-    ensure_object(servers)?;
-    let entry = readzip_mcp_entry();
-    servers
-        .as_object_mut()
-        .expect("validated object")
-        .insert("readzip".to_string(), entry);
-
-    let pretty = serde_json::to_string_pretty(&settings)
-        .map_err(|err| format!("failed to serialize {agent_label} settings: {err}"))?;
-    fs::write(&path, format!("{pretty}\n"))
-        .map_err(|err| format!("failed to write {agent_label} settings: {err}"))?;
     Ok(())
-}
-
-fn readzip_mcp_entry() -> Value {
-    let exe = env::current_exe()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "readzip".to_string());
-    json!({
-        "command": exe,
-        "args": ["mcp"],
-    })
 }
 
 fn record_intercept(
